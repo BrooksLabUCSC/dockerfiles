@@ -1,0 +1,191 @@
+#!/bin/bash
+
+print_usage(){
+>&2 cat <<EOF
+$0 -s <input.bam> -i <sample ID> -a <annotation.bed>
+
+This tool runs quality control on input bamfiles. It runs the following RSEQC programs:
+	bam_stat.py
+	geneBody_coverage.py
+	junction_saturation.py
+	junction_annotation.py
+	read_distribution.py
+	clipping_profile.py
+
+It also runs a separate samAlignStats.py program that creates histograms for
+	read size and alignment length
+	indel, gc percentage, and alignment as fraction of total read length
+	insertions and deletions as fraction of alignment length
+
+The outputs of these programs (mostly .png files) are presented in HTML. 
+This program will create a directory named <sample ID>_html, which contains <sample ID>.html
+Open that file to see the results.
+	
+
+OPTIONS:
+   -h      Show this message
+   -b      Input bam file
+   -i      Sample ID
+   -a      Genome annotation in bed format (e.g gencode_v24_hg38.bed)
+
+EOF
+}
+
+INPUT='False'
+REF_GENE_BED='False'
+SAMPLE_NAME='sample'
+
+while getopts "hb:i:a:" OPTION
+
+do
+     case $OPTION in
+         h)
+             print_usage
+             exit
+             ;;
+         b)
+             INPUT=$OPTARG
+             ;;
+         i)
+             SAMPLE_NAME=$OPTARG
+             ;;
+         a)
+             REF_GENE_BED=$OPTARG
+             ;;
+         ?)
+             print_usage
+             exit
+             ;;
+     esac
+done
+
+graceful_death() {
+        >&2 echo "ERROR: Cannot finish $0 because $1";
+        exit 1
+}
+
+# Check if all file arguments have been given and are valid
+file_check() {
+    if [ $1 == 'False' ]; then
+        print_usage
+        graceful_death "missing some input arguments"
+    fi
+    if [[ ! -e "$1" ]]; then
+        print_usage
+        graceful_death "can't find $1"
+    fi
+}
+
+for i in $INPUT $REF_GENE_BED; do
+        file_check $i
+done
+
+# If bam has not been indexed, create one
+if [[ ! -e "$INPUT.bai" ]]; then
+        samtools sort $INPUT $INPUT.sorted
+        echo >&2 "indexing $INPUT..."
+	samtools index $INPUT.sorted.bam 
+        INPUT=$INPUT.sorted.bam
+fi
+
+
+RSEQC_DIR='/usr/local/bin'
+OUTDIR='/tmp'
+MAP_QUAL=30	# see if this needs changing
+
+HDIR=${SAMPLE_NAME}_html
+mkdir -p $HDIR 
+html="$HDIR/$SAMPLE_NAME.html"
+
+# Create HTML output during the run. First, create the header
+>$html cat <<EOF
+<!doctype html>
+
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+
+  <title>Nanopore QC output</title>
+
+
+</head>
+
+<body>
+EOF
+echo "<H2>QC output for $SAMPLE_NAME</H2>" >> $html
+echo '<H3>bam_stat output</H3>' >> $html
+
+# Bam_stat creates a text file
+echo running bam_stat...
+#$RSEQC_DIR/bam_stat.py --mapq=$MAP_QUAL --input=$INPUT > $OUTDIR/$SAMPLE_NAME.bam.stat
+echo '<pre>' >> $html
+#cat $OUTDIR/$SAMPLE_NAME.bam.stat >> $html
+echo '</pre>' >> $html
+
+# samAlignStats creates png files; it takes sam input so convert first
+echo running samAlignStats...
+echo '<H3>Alignment stats</H3>' >> $html
+samtools sort -n $INPUT $INPUT.sorted
+samtools view -h $INPUT.sorted.bam > tmp.sam
+samAlignStats.py -b $OUTDIR/$SAMPLE_NAME tmp.sam
+rm tmp.sam $INPUT.sorted.bam
+
+cp $OUTDIR/$SAMPLE_NAME.QC.png $HDIR/$SAMPLE_NAME.QC.png
+cp $OUTDIR/$SAMPLE_NAME.sizes.png $HDIR/$SAMPLE_NAME.sizes.png
+cp $OUTDIR/$SAMPLE_NAME.indel.png $HDIR/$SAMPLE_NAME.indel.png
+echo "<img src=\"$SAMPLE_NAME.sizes.png\" alt=\"qc plot\" height=400 width=400> " >> $html
+echo "<img src=\"$SAMPLE_NAME.QC.png\" alt=\"qc plot\" height=400 width=400> " >> $html
+echo "<img src=\"$SAMPLE_NAME.indel.png\" alt=\"qc plot\" height=400 width=400> " >> $html
+
+# Genebody
+echo running genebody coverage...
+$RSEQC_DIR/geneBody_coverage.py --refgene=$REF_GENE_BED --input=$INPUT --format=png --out-prefix=$OUTDIR/$SAMPLE_NAME 
+cp $OUTDIR/$SAMPLE_NAME.geneBodyCoverage.curves.png $HDIR/$SAMPLE_NAME.geneBodyCoverage.curves.png
+echo '<H3>Genebody coverage</H3>' >> $html
+echo "<img src=\"$SAMPLE_NAME.geneBodyCoverage.curves.png\" alt=\"genebody plot\" height=400 width=400> " >> $html
+
+# TODO: replace this with rpm(?)
+#echo fpkm count
+#$RSEQC_DIR/FPKM_count.py --input=$INPUT --mapq=$MAP_QUAL --refgene=$REF_GENE_BED --out-prefix=$OUTDIR/$SAMPLE_NAME.rpkm.count 
+
+#cp $OUTDIR/$SAMPLE_NAME.rpkm.count.FPKM.xls $HDIR/$SAMPLE_NAME.rpkm.txt
+#echo '<H3>FPKM count</H3>' >> $html
+#echo "The FPKM file can be found <a href='$SAMPLE_NAME.rpkm.txt'>here</a>" >> $html
+
+# Junction saturation
+echo running junction saturation...
+$RSEQC_DIR/junction_saturation.py --input=$INPUT --mapq=$MAP_QUAL --refgene=$REF_GENE_BED --out-prefix=$OUTDIR/$SAMPLE_NAME 
+
+cp $OUTDIR/$SAMPLE_NAME.junctionSaturation_plot.png $HDIR/$SAMPLE_NAME.junctionSaturation_plot.png
+echo '<H3>Junction saturation</H3>' >> $html
+echo "<img src=\"$SAMPLE_NAME.junctionSaturation_plot.png\" alt=\"junction saturation plot\" height=400 width=400> " >> $html
+
+# Junction annotation
+echo running junction annotation... 
+$RSEQC_DIR/junction_annotation.py --input=$INPUT --refgene=$REF_GENE_BED --out-prefix=$OUTDIR/$SAMPLE_NAME 
+
+echo '<H3>Junction annotation</H3>' >> $html
+
+# junction file contains annotated, partial novel, and complete novel; split these
+for i in annotated novel; do
+	grep "$i	" $OUTDIR/$SAMPLE_NAME.junction.bed | sort -k1,1 -k2,2n > $HDIR/$SAMPLE_NAME.junctions_$i.bed
+	echo "<p><a href='$SAMPLE_NAME.junctions_$i.bed'>$i junctions (bed file)</a>" >> $html
+done
+cp $OUTDIR/$SAMPLE_NAME.splice_events.png $HDIR/$SAMPLE_NAME.splice_events.png
+cp $OUTDIR/$SAMPLE_NAME.splice_junction.png $HDIR/$SAMPLE_NAME.splice_junction.png
+echo "<img src=\"$SAMPLE_NAME.splice_events.png\" alt=\"splice events plot\" height=400 width=400> " >> $html
+echo "<img src=\"$SAMPLE_NAME.splice_junction.png\" alt=\"splice junction plot\" height=400 width=400> " >> $html
+
+# Read distribution
+echo running read distribution...
+$RSEQC_DIR/read_distribution.py --input=$INPUT --refgene=$REF_GENE_BED > $OUTDIR/$SAMPLE_NAME.read.distribution 
+echo '<H3>Read distribution output</H3>' >> $html
+echo '<pre>' >> $html
+cat $OUTDIR/$SAMPLE_NAME.read.distribution >> $html
+echo '</pre>' >> $html
+
+echo '</body>' >> $html
+echo '</html>' >> $html
+
+#tar cvf $SAMPLE_NAME.tar $HDIR
+
